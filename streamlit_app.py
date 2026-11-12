@@ -1,8 +1,6 @@
-"""
-DNA Sequence Analyzer - Streamlit web app
-Run locally:  streamlit run streamlit_app.py
-Requires fasta_toolkit.py in the same folder.
-"""
+"""Interactive Streamlit interface for DNA sequence exploration."""
+
+from __future__ import annotations
 
 import io
 
@@ -10,151 +8,216 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from Bio import Entrez, SeqIO
+from Bio.Data import CodonTable
 from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
 from fasta_toolkit import clean_seq, find_orfs, sequence_stats, translate_dna
 
-st.set_page_config(page_title="DNA Sequence Analyzer", page_icon="🧬", layout="wide")
-st.title("🧬 DNA Sequence Analyzer & FASTA Toolkit")
-st.caption("Inspect sequences, find ORFs in all six frames, and translate DNA to protein.")
+st.set_page_config(page_title="DNA Sequence Explorer", page_icon="🧬", layout="wide")
+
+st.title("🧬 DNA Sequence Explorer")
+st.markdown(
+    "Explore FASTA sequences with clear, reproducible summaries. Calculate base composition, "
+    "inspect local GC variation, identify **candidate** ORFs, and translate selected regions."
+)
+st.caption("Educational bioinformatics tool · Results are computational predictions, not experimental validation.")
 
 
-# ---------------------------------------------------------------- helpers
-@st.cache_data(show_spinner="Downloading from NCBI GenBank...")
+@st.cache_data(show_spinner="Retrieving sequence from NCBI…")
 def fetch_ncbi(accession: str, email: str) -> str:
     Entrez.email = email
-    with Entrez.efetch(db="nucleotide", id=accession, rettype="fasta", retmode="text") as h:
-        return h.read()
+    with Entrez.efetch(db="nucleotide", id=accession, rettype="fasta", retmode="text") as handle:
+        data = handle.read()
+    if not data.lstrip().startswith(">"):
+        raise ValueError("NCBI did not return a FASTA record. Check the accession and try again.")
+    return data
 
 
-def parse_fasta(text: str):
+def parse_fasta(text: str) -> list[SeqRecord]:
+    """Parse FASTA text or wrap a raw nucleotide string as one record."""
     text = text.strip()
-    if text and not text.startswith(">"):
+    if not text:
+        return []
+    if not text.startswith(">"):
         text = ">pasted_sequence\n" + text
-    return list(SeqIO.parse(io.StringIO(text), "fasta"))
+    records = list(SeqIO.parse(io.StringIO(text), "fasta"))
+    for record in records:
+        clean_seq(record)
+    return records
 
 
-@st.cache_data(show_spinner="Scanning six reading frames...")
-def cached_orfs(seq_str: str, min_aa: int, table: int):
-    return find_orfs(Seq(seq_str), min_aa=min_aa, table=table)
+@st.cache_data(show_spinner="Scanning six reading frames…")
+def cached_orfs(sequence: str, min_aa: int, table: int):
+    return find_orfs(sequence, min_aa=min_aa, table=table)
 
 
-def gc_windows(seq_str: str, window: int):
-    arr = np.frombuffer(seq_str.encode(), dtype=np.uint8)
+def gc_windows(sequence: str, window: int) -> pd.DataFrame:
+    """Calculate GC% in overlapping windows; ambiguous bases are excluded."""
+    text = sequence.upper()
+    if not text or window < 1 or len(text) < window:
+        return pd.DataFrame(columns=["GC %"])
+    arr = np.frombuffer(text.encode("ascii"), dtype=np.uint8)
+    canonical = np.isin(arr, [ord("A"), ord("C"), ord("G"), ord("T")]).astype(np.int64)
     gc = ((arr == ord("G")) | (arr == ord("C"))).astype(np.int64)
-    csum = np.concatenate([[0], np.cumsum(gc)])
+    gc_sum = np.concatenate(([0], np.cumsum(gc)))
+    base_sum = np.concatenate(([0], np.cumsum(canonical)))
     step = max(window // 2, len(arr) // 3000, 1)
-    starts = np.arange(0, max(len(arr) - window, 0) + 1, step)
-    vals = 100 * (csum[starts + window] - csum[starts]) / window if len(arr) >= window else np.array([])
-    return pd.DataFrame({"position": starts + window // 2, "GC %": vals}).set_index("position")
+    starts = np.arange(0, len(arr) - window + 1, step)
+    gc_counts = gc_sum[starts + window] - gc_sum[starts]
+    base_counts = base_sum[starts + window] - base_sum[starts]
+    values = np.divide(100 * gc_counts, base_counts, out=np.zeros(len(starts), dtype=float), where=base_counts > 0)
+    return pd.DataFrame({"position (bp)": starts + window // 2, "GC %": values}).set_index("position (bp)")
 
 
-# ---------------------------------------------------------------- sidebar input
 with st.sidebar:
-    st.header("1. Load a sequence")
-    source = st.radio("Source", ["Upload FASTA", "Paste sequence", "Fetch from NCBI"])
+    st.header("1 · Load sequence")
+    source = st.radio("Choose a source", ["Upload FASTA", "Paste sequence", "NCBI accession"])
     raw = ""
     if source == "Upload FASTA":
-        up = st.file_uploader("FASTA file", type=["fasta", "fa", "fna", "txt"])
-        if up:
-            raw = up.getvalue().decode("utf-8", errors="ignore")
+        upload = st.file_uploader("FASTA file", type=["fasta", "fa", "fna", "fas", "txt"])
+        if upload:
+            raw = upload.getvalue().decode("utf-8-sig", errors="replace")
     elif source == "Paste sequence":
-        raw = st.text_area("FASTA or raw DNA", height=200)
+        raw = st.text_area("Paste FASTA or raw DNA/RNA", height=180, placeholder=">sequence_id\nATG...")
     else:
-        acc = st.text_input("Accession", "NC_045512.2")
-        email = st.text_input("Your email (required by NCBI)")
-        if st.button("Fetch") and acc and email:
-            try:
-                st.session_state["ncbi_raw"] = fetch_ncbi(acc, email)
-            except Exception as e:
-                st.error(f"Download failed: {e}")
-        raw = st.session_state.get("ncbi_raw", "")
+        accession = st.text_input("NCBI nucleotide accession", placeholder="e.g. NC_045512.2")
+        email = st.text_input("Contact email (required by NCBI)", placeholder="you@example.org")
+        if st.button("Fetch sequence", type="primary"):
+            if not accession.strip() or not email.strip():
+                st.error("Enter both an accession and contact email.")
+            else:
+                try:
+                    st.session_state["ncbi_fasta"] = fetch_ncbi(accession.strip(), email.strip())
+                    st.session_state["ncbi_accession"] = accession.strip()
+                except Exception as exc:
+                    st.error(f"Could not fetch sequence: {exc}")
+        raw = st.session_state.get("ncbi_fasta", "")
 
-    st.header("2. Settings")
-    table = st.number_input("Genetic code table", 1, 33, 1, help="1 = standard, 11 = bacterial")
+    st.divider()
+    st.header("2 · Analysis settings")
+    table_ids = sorted(CodonTable.unambiguous_dna_by_id)
+    table_names = {number: CodonTable.unambiguous_dna_by_id[number].names[0] for number in table_ids}
+    selected_table = st.selectbox(
+        "Genetic code",
+        table_ids,
+        index=table_ids.index(1),
+        format_func=lambda number: f"{number} · {table_names[number]}",
+        help="Choose the NCBI translation table appropriate for the organism/sequence.",
+    )
 
 if not raw.strip():
-    st.info("👈 Load a sequence from the sidebar. Try accession **NC_045512.2** (SARS-CoV-2) via *Fetch from NCBI*.")
+    st.info("Load a sequence from the sidebar to begin. For a first example, try an NCBI accession such as **NC_045512.2**.")
     st.stop()
 
-records = parse_fasta(raw)
+try:
+    records = parse_fasta(raw)
+except (ValueError, UnicodeError) as exc:
+    st.error(f"Sequence input could not be parsed: {exc}")
+    st.stop()
+
 if not records:
-    st.error("No valid FASTA records found.")
+    st.error("No FASTA records were found. Check the input and try again.")
     st.stop()
 
-ids = [r.id for r in records]
-rec = records[ids.index(st.sidebar.selectbox("Record", ids))] if len(ids) > 1 else records[0]
-seq = clean_seq(rec)
-seq_str = str(seq)
+if len(records) > 1:
+    selected_id = st.selectbox("Select FASTA record", range(len(records)), format_func=lambda i: f"{records[i].id} — {len(records[i].seq):,} bp")
+else:
+    selected_id = 0
+record = records[selected_id]
+sequence = clean_seq(record)
+sequence_text = str(sequence)
+if not sequence_text:
+    st.warning("The selected FASTA record contains no sequence bases.")
+    st.stop()
 
-tab_stats, tab_orf, tab_tr = st.tabs(["📊 Statistics", "🔎 ORF finder", "🔤 Translation"])
+with st.expander("Sequence metadata", expanded=False):
+    st.write(f"**Record:** `{record.id}`")
+    st.write(f"**Description:** {record.description or 'No description provided'}")
+    st.write(f"**Input:** {len(records)} FASTA record(s) · selected record has {len(sequence):,} bp")
 
-# ---------------------------------------------------------------- stats
-with tab_stats:
-    s = sequence_stats(rec)
-    st.subheader(s["id"])
-    st.write(s["description"])
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Length (bp)", f"{s['length']:,}")
-    c2.metric("GC content", f"{s['gc_percent']:.2f}%")
-    c3.metric("GC skew", f"{s['gc_skew']:+.4f}")
-    c4.metric("Ambiguous bases", f"{s['ambiguous']:,}")
+stats_tab, composition_tab, orf_tab, translation_tab = st.tabs(
+    ["📊 Overview", "🧪 Composition & GC", "🔎 ORF candidates", "🔤 Translation"]
+)
 
+with stats_tab:
+    summary = sequence_stats(record)
+    st.subheader("Sequence summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Length", f"{summary['length']:,} bp")
+    col2.metric("GC content", f"{summary['gc_percent']:.2f}%", help="Calculated among unambiguous A/C/G/T bases.")
+    col3.metric("GC skew", f"{summary['gc_skew']:+.4f}", help="(G − C) / (G + C); descriptive and not diagnostic by itself.")
+    col4.metric("Ambiguous bases", f"{summary['ambiguous']:,}")
+    st.write(f"AT content among unambiguous bases: **{summary['at_percent']:.2f}%**")
+    st.caption("GC/AT percentages use only canonical A, C, G, and T bases; ambiguous symbols are counted separately.")
+    reverse = SeqRecord(sequence.reverse_complement(), id=f"{record.id}_revcomp", description="reverse complement")
+    rc_buffer = io.StringIO()
+    SeqIO.write(reverse, rc_buffer, "fasta")
+    st.download_button("Download reverse complement (FASTA)", rc_buffer.getvalue(), file_name=f"{record.id}_revcomp.fasta", mime="text/plain")
+
+with composition_tab:
+    st.subheader("Nucleotide composition")
+    composition = pd.DataFrame({"Count": summary["composition"], "Percent of A/C/G/T": summary["composition_percent"]})
     left, right = st.columns(2)
     with left:
-        st.markdown("**Base composition**")
-        st.bar_chart(pd.Series(s["composition"], name="count"))
+        st.bar_chart(composition["Count"], color="#19a974")
     with right:
-        window = st.slider("GC window (bp)", 100, 5000, 1000, 100)
-        st.markdown("**GC content along the sequence**")
-        df = gc_windows(seq_str, window)
-        if df.empty:
-            st.caption("Sequence shorter than the window.")
+        st.dataframe(composition.style.format({"Count": "{:,.0f}", "Percent of A/C/G/T": "{:.2f}%"}), use_container_width=True)
+    max_window = min(5000, len(sequence))
+    if max_window < 1:
+        st.info("No bases available for a GC window plot.")
+    else:
+        default_window = min(500, max_window)
+        window = st.slider("Sliding-window width (bp)", min_value=1, max_value=max_window, value=default_window)
+        gc_data = gc_windows(sequence_text, window)
+        if gc_data.empty:
+            st.info("The selected sequence is shorter than the window.")
         else:
-            st.line_chart(df)
+            st.markdown("**Local GC content**")
+            st.line_chart(gc_data, y="GC %", color="#4c78a8")
+            st.caption("Windows overlap by approximately 50%. Ambiguous bases are excluded from each window's denominator.")
 
-    rc = seq.reverse_complement()
-    st.download_button("Download reverse complement (FASTA)",
-                       f">{rec.id}_revcomp\n{rc}\n", file_name=f"{rec.id}_revcomp.fasta")
-
-# ---------------------------------------------------------------- ORFs
-with tab_orf:
-    min_aa = st.slider("Minimum ORF length (amino acids)", 30, 1000, 100, 10)
-    orfs = cached_orfs(seq_str, min_aa, int(table))
-    st.write(f"**{len(orfs)}** ORFs ≥ {min_aa} aa (ATG start, six frames)")
+with orf_tab:
+    st.subheader("Six-frame ORF candidate search")
+    st.warning("ORFs are sequence-based candidates, not proof of gene expression or function. This simple method uses ATG starts and the selected genetic code's stop codons; it does not model splice sites, promoters, or organism-specific biology.")
+    min_aa = st.slider("Minimum ORF length (amino acids; stop codon excluded)", 1, min(1000, max(1, len(sequence) // 3)), min(100, max(1, len(sequence) // 3)), 1)
+    with st.spinner("Searching forward and reverse-complement frames…"):
+        orfs = cached_orfs(sequence_text, min_aa, selected_table)
+    st.metric("Candidates found", len(orfs))
     if orfs:
-        df = pd.DataFrame(orfs)
-        df.insert(0, "#", range(1, len(df) + 1))
-        st.dataframe(df.drop(columns="protein"), use_container_width=True, hide_index=True)
-
-        fasta_out = "".join(
-            f">{rec.id}_ORF{i} strand={o['strand']} frame={o['frame']} {o['start']}-{o['end']} {o['aa_length']}aa\n"
-            f"{o['protein']}\n" for i, o in enumerate(orfs, 1))
-        st.download_button("Download ORF proteins (FASTA)", fasta_out, file_name=f"{rec.id}_orfs.faa")
-
-        pick = st.number_input("View protein #", 1, len(orfs), 1)
-        o = orfs[pick - 1]
-        st.code(o["protein"], language=None)
-
-        # simple map of ORFs
-        st.markdown("**ORF length by genome position**")
-        st.scatter_chart(df, x="start", y="aa_length", color="strand")
+        orf_frame = pd.DataFrame(orfs)
+        display = orf_frame.drop(columns=["protein"]).copy()
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        fasta_text = "".join(
+            f">{record.id}_ORF{i} strand={hit['strand']} frame={hit['frame']} "
+            f"coordinates={hit['start']}-{hit['end']} length={hit['aa_length']}aa\n{hit['protein']}\n"
+            for i, hit in enumerate(orfs, 1)
+        )
+        st.download_button("Download candidate proteins (FASTA)", fasta_text, file_name=f"{record.id}_orfs.faa", mime="text/plain")
+        st.markdown("**Candidate length by start coordinate**")
+        st.scatter_chart(display, x="start", y="aa_length", color="strand")
+        selected_orf = st.selectbox("Inspect predicted protein", range(len(orfs)), format_func=lambda i: f"ORF {i + 1}: {orfs[i]['strand']} strand, {orfs[i]['start']}–{orfs[i]['end']} ({orfs[i]['aa_length']} aa)")
+        st.code("\n".join(orfs[selected_orf]["protein"][i:i + 60] for i in range(0, len(orfs[selected_orf]["protein"]), 60)), language=None)
     else:
-        st.warning("No ORFs found at this threshold. Try lowering the minimum length.")
+        st.info("No ORF candidates met this threshold. Try a shorter minimum length or another genetic code.")
 
-# ---------------------------------------------------------------- translate
-with tab_tr:
-    c1, c2, c3 = st.columns(3)
-    start = c1.number_input("Start (1-based)", 1, len(seq), 1)
-    end = c2.number_input("End (inclusive)", 1, len(seq), len(seq))
-    frame = c3.selectbox("Frame", [1, 2, 3, -1, -2, -3])
-    to_stop = st.checkbox("Stop at first stop codon")
+with translation_tab:
+    st.subheader("Translate a selected region")
+    region_col1, region_col2, region_col3 = st.columns(3)
+    start = region_col1.number_input("Start coordinate (1-based)", min_value=1, max_value=len(sequence), value=1)
+    end = region_col2.number_input("End coordinate (inclusive)", min_value=1, max_value=len(sequence), value=len(sequence))
+    frame = region_col3.selectbox("Reading frame", [1, 2, 3, -1, -2, -3], format_func=lambda value: f"{value:+d}" if value > 0 else str(value))
+    to_stop = st.checkbox("Stop translation at the first in-frame stop codon")
     if end < start:
-        st.error("End must be ≥ start.")
+        st.error("End coordinate must be greater than or equal to start coordinate.")
     else:
-        protein = translate_dna(seq[start - 1:end], frame=frame, table=int(table), to_stop=to_stop)
-        st.write(f"**{len(protein):,}** amino acids")
-        st.code("\n".join(protein[i:i + 60] for i in range(0, len(protein), 60)), language=None)
-        st.download_button("Download protein (FASTA)",
-                           f">{rec.id}_{start}-{end}_frame{frame}\n{protein}\n",
-                           file_name=f"{rec.id}_translation.faa")
+        protein = translate_dna(sequence[start - 1:end], frame=frame, table=selected_table, to_stop=to_stop)
+        st.write(f"**Translated length:** {len(protein):,} amino acid(s)")
+        if protein:
+            st.code("\n".join(protein[i:i + 60] for i in range(0, len(protein), 60)), language=None)
+        else:
+            st.info("The selected region does not contain a complete codon in this frame.")
+        protein_record = SeqRecord(Seq(protein), id=f"{record.id}_{start}-{end}_frame{frame}", description=f"genetic_code={selected_table}")
+        protein_buffer = io.StringIO()
+        SeqIO.write(protein_record, protein_buffer, "fasta")
+        st.download_button("Download translated protein (FASTA)", protein_buffer.getvalue(), file_name=f"{record.id}_translation.faa", mime="text/plain")
