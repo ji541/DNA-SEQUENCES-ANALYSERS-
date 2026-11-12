@@ -22,16 +22,32 @@ st.caption("Inspect sequences, find ORFs in all six frames, and translate DNA to
 # ---------------------------------------------------------------- helpers
 @st.cache_data(show_spinner="Downloading from NCBI GenBank...")
 def fetch_ncbi(accession: str, email: str) -> str:
+    accession = (accession or "").strip()
+    email = (email or "").strip()
+    if not accession:
+        raise ValueError("Please provide a valid accession.")
+    if not email or "@" not in email:
+        raise ValueError("Please provide a valid email address for the NCBI request.")
+
     Entrez.email = email
     with Entrez.efetch(db="nucleotide", id=accession, rettype="fasta", retmode="text") as h:
-        return h.read()
+        data = h.read()
+    if not data or not data.lstrip().startswith(">"):
+        raise ValueError(f"NCBI did not return a valid FASTA record for accession '{accession}'.")
+    return data
 
 
 def parse_fasta(text: str):
-    text = text.strip()
-    if text and not text.startswith(">"):
+    text = (text or "").strip()
+    if not text:
+        return []
+    if not text.startswith(">"):
         text = ">pasted_sequence\n" + text
-    return list(SeqIO.parse(io.StringIO(text), "fasta"))
+    try:
+        records = list(SeqIO.parse(io.StringIO(text), "fasta"))
+    except Exception:
+        return []
+    return records
 
 
 @st.cache_data(show_spinner="Scanning six reading frames...")
@@ -40,12 +56,15 @@ def cached_orfs(seq_str: str, min_aa: int, table: int):
 
 
 def gc_windows(seq_str: str, window: int):
+    seq_str = seq_str.upper().replace("U", "T")
     arr = np.frombuffer(seq_str.encode(), dtype=np.uint8)
     gc = ((arr == ord("G")) | (arr == ord("C"))).astype(np.int64)
     csum = np.concatenate([[0], np.cumsum(gc)])
     step = max(window // 2, len(arr) // 3000, 1)
     starts = np.arange(0, max(len(arr) - window, 0) + 1, step)
-    vals = 100 * (csum[starts + window] - csum[starts]) / window if len(arr) >= window else np.array([])
+    vals = np.array([])
+    if len(arr) >= window:
+        vals = 100 * (csum[starts + window] - csum[starts]) / window
     return pd.DataFrame({"position": starts + window // 2, "GC %": vals}).set_index("position")
 
 
@@ -66,8 +85,9 @@ with st.sidebar:
         if st.button("Fetch") and acc and email:
             try:
                 st.session_state["ncbi_raw"] = fetch_ncbi(acc, email)
-            except Exception as e:
-                st.error(f"Download failed: {e}")
+                st.success(f"Fetched accession {acc}.")
+            except Exception as exc:
+                st.error(f"Download failed: {exc}")
         raw = st.session_state.get("ncbi_raw", "")
 
     st.header("2. Settings")
@@ -79,13 +99,20 @@ if not raw.strip():
 
 records = parse_fasta(raw)
 if not records:
-    st.error("No valid FASTA records found.")
+    st.error("No valid FASTA records found. Please paste a FASTA file or raw DNA sequence containing A/C/G/T bases.")
     st.stop()
 
 ids = [r.id for r in records]
-rec = records[ids.index(st.sidebar.selectbox("Record", ids))] if len(ids) > 1 else records[0]
+selection = st.sidebar.selectbox("Record", ids)
+rec = records[ids.index(selection)] if len(ids) > 1 else records[0]
 seq = clean_seq(rec)
 seq_str = str(seq)
+
+if len(seq_str) == 0:
+    st.warning("The loaded sequence is empty after cleaning. Please provide a valid DNA sequence.")
+    st.stop()
+
+st.sidebar.caption(f"Loaded {len(seq_str):,} bases across {len(ids)} record(s).")
 
 tab_stats, tab_orf, tab_tr = st.tabs(["📊 Statistics", "🔎 ORF finder", "🔤 Translation"])
 
@@ -114,8 +141,7 @@ with tab_stats:
             st.line_chart(df)
 
     rc = seq.reverse_complement()
-    st.download_button("Download reverse complement (FASTA)",
-                       f">{rec.id}_revcomp\n{rc}\n", file_name=f"{rec.id}_revcomp.fasta")
+    st.download_button("Download reverse complement (FASTA)", f">{rec.id}_revcomp\n{rc}\n", file_name=f"{rec.id}_revcomp.fasta")
 
 # ---------------------------------------------------------------- ORFs
 with tab_orf:
@@ -136,7 +162,6 @@ with tab_orf:
         o = orfs[pick - 1]
         st.code(o["protein"], language=None)
 
-        # simple map of ORFs
         st.markdown("**ORF length by genome position**")
         st.scatter_chart(df, x="start", y="aa_length", color="strand")
     else:

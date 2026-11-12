@@ -1,36 +1,15 @@
 #!/usr/bin/env python3
-"""
-DNA Sequence Analyzer & FASTA Toolkit
-=====================================
-Inspect a FASTA file, find open reading frames (ORFs) on all six frames,
-and translate DNA into amino acids, using Biopython.
+"""DNA Sequence Analyzer & FASTA Toolkit.
 
-Setup
------
-    pip install biopython
-
-Usage
------
-    # 1. Download SARS-CoV-2 reference genome from NCBI (needs internet + your email)
-    python fasta_toolkit.py download NC_045512.2 --email you@example.com -o NC_045512.2.fasta
-
-    # 2. Basic sequence statistics
-    python fasta_toolkit.py stats NC_045512.2.fasta
-
-    # 3. Find ORFs of at least 100 amino acids (all 6 frames), save proteins to FASTA
-    python fasta_toolkit.py orfs NC_045512.2.fasta --min-aa 100 --proteins-out orfs.faa
-
-    # 4. Translate: whole sequence in frame 1, or a region (1-based, inclusive)
-    python fasta_toolkit.py translate NC_045512.2.fasta --frame 1
-    python fasta_toolkit.py translate NC_045512.2.fasta --start 21563 --end 25384 --to-stop
-
-    # 5. Reverse complement
-    python fasta_toolkit.py revcomp NC_045512.2.fasta -o revcomp.fasta
+This module provides a small command-line and library toolkit for FASTA
+sequence inspection, GC analysis, ORF detection, reverse-complement
+calculation, and DNA-to-protein translation.
 """
 
 import argparse
 import sys
 from collections import Counter
+from pathlib import Path
 
 from Bio import Entrez, SeqIO
 from Bio.Data import CodonTable
@@ -43,27 +22,47 @@ from Bio.SeqRecord import SeqRecord
 # --------------------------------------------------------------------------
 def download_fasta(accession: str, email: str, out_path: str) -> str:
     """Download a nucleotide record from NCBI GenBank as FASTA."""
-    Entrez.email = email  # NCBI requires a contact email
+    accession = (accession or "").strip()
+    email = (email or "").strip()
+    if not accession:
+        raise ValueError("An accession number is required.")
+    if not email or "@" not in email:
+        raise ValueError("A valid email address is required by NCBI.")
+
+    Entrez.email = email
     with Entrez.efetch(db="nucleotide", id=accession, rettype="fasta", retmode="text") as handle:
         data = handle.read()
-    if not data.startswith(">"):
-        sys.exit(f"Unexpected response from NCBI for '{accession}':\n{data[:200]}")
-    with open(out_path, "w") as fh:
-        fh.write(data)
-    return out_path
+
+    if not data or not data.lstrip().startswith(">"):
+        raise ValueError(f"Unexpected response from NCBI for '{accession}':\n{data[:200]}")
+
+    target = Path(out_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(data, encoding="utf-8")
+    return str(target)
 
 
 def load_records(path: str) -> list:
-    """Parse a FASTA file and return all records (validates the format)."""
-    records = list(SeqIO.parse(path, "fasta"))
+    """Parse a FASTA file and return all records after validating the format."""
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"FASTA file not found: '{path}'")
+
+    records = list(SeqIO.parse(str(file_path), "fasta"))
     if not records:
-        sys.exit(f"No FASTA records found in '{path}'. Is it a valid FASTA file?")
+        raise ValueError(f"No FASTA records found in '{path}'. Is it a valid FASTA file?")
     return records
 
 
 def clean_seq(record: SeqRecord) -> Seq:
-    """Uppercase the sequence and convert RNA 'U' to 'T'."""
-    return Seq(str(record.seq).upper().replace("U", "T"))
+    """Uppercase the sequence, remove whitespace, and convert RNA 'U' to 'T'."""
+    if record is None or record.seq is None:
+        raise ValueError("The input record does not contain a valid sequence.")
+    clean = "".join(str(record.seq).upper().split())
+    clean = clean.replace("U", "T")
+    if not clean:
+        raise ValueError("The input sequence is empty after cleaning.")
+    return Seq(clean)
 
 
 # --------------------------------------------------------------------------
@@ -71,26 +70,33 @@ def clean_seq(record: SeqRecord) -> Seq:
 # --------------------------------------------------------------------------
 def gc_content(seq: Seq) -> float:
     """GC percentage over unambiguous bases (A, C, G, T)."""
-    s = str(seq)
+    s = str(seq).upper()
     acgt = sum(s.count(b) for b in "ACGT")
-    return 100.0 * (s.count("G") + s.count("C")) / acgt if acgt else 0.0
+    if acgt == 0:
+        return 0.0
+    return 100.0 * (s.count("G") + s.count("C")) / acgt
 
 
 def sequence_stats(record: SeqRecord) -> dict:
     seq = clean_seq(record)
-    counts = Counter(str(seq))
-    length = len(seq)
-    g, c = counts.get("G", 0), counts.get("C", 0)
+    sequence = str(seq)
+    counts = Counter(sequence)
+    length = len(sequence)
+    g = counts.get("G", 0)
+    c = counts.get("C", 0)
+    ambiguous = sum(v for k, v in counts.items() if k not in "ACGT")
+    gc = gc_content(seq)
+
     return {
         "id": record.id,
         "description": record.description,
         "length": length,
-        "gc_percent": gc_content(seq),
-        "at_percent": 100.0 - gc_content(seq) if length else 0.0,
+        "gc_percent": gc,
+        "at_percent": 100.0 - gc if length else 0.0,
         "gc_skew": (g - c) / (g + c) if (g + c) else 0.0,
         "composition": {b: counts.get(b, 0) for b in "ACGT"},
-        "ambiguous": length - sum(counts.get(b, 0) for b in "ACGT"),
-        "starts_with_atg": str(seq).startswith("ATG"),
+        "ambiguous": ambiguous,
+        "starts_with_atg": sequence.startswith("ATG"),
     }
 
 
@@ -98,13 +104,18 @@ def sequence_stats(record: SeqRecord) -> dict:
 # ORF finding
 # --------------------------------------------------------------------------
 def find_orfs(seq: Seq, min_aa: int = 100, table: int = 1) -> list:
-    """
-    Find ORFs (ATG ... stop) in all six reading frames.
+    """Find ORFs (ATG ... stop) in all six reading frames.
 
     Returns a list of dicts sorted by length (longest first). Coordinates are
     1-based, inclusive, and always relative to the forward strand.
-    Only the outermost (longest) ORF per stop codon is reported.
     """
+    if not isinstance(seq, Seq):
+        seq = Seq(str(seq))
+
+    min_aa = max(int(min_aa), 1)
+    if table not in CodonTable.unambiguous_dna_by_id:
+        raise ValueError(f"Unsupported genetic code table: {table}")
+
     stops = set(CodonTable.unambiguous_dna_by_id[table].stop_codons)
     n = len(seq)
     orfs = []
@@ -118,7 +129,7 @@ def find_orfs(seq: Seq, min_aa: int = 100, table: int = 1) -> list:
                     j = i
                     while j + 3 <= n and s[j:j + 3] not in stops:
                         j += 3
-                    if j + 3 <= n:  # a stop codon was reached
+                    if j + 3 <= n:
                         aa_len = (j - i) // 3
                         if aa_len >= min_aa:
                             if strand == "+":
@@ -134,9 +145,9 @@ def find_orfs(seq: Seq, min_aa: int = 100, table: int = 1) -> list:
                                 "aa_length": aa_len,
                                 "protein": str(Seq(s[i:j]).translate(table=table)),
                             })
-                        i = j + 3  # continue after the stop; skips nested ATGs
+                        i = j + 3
                         continue
-                    break  # ran off the end of the sequence without a stop
+                    break
                 i += 3
 
     return sorted(orfs, key=lambda o: o["aa_length"], reverse=True)
@@ -149,10 +160,14 @@ def translate_dna(seq: Seq, frame: int = 1, table: int = 1, to_stop: bool = Fals
     """Translate DNA in frame 1-3 (forward) or -1 to -3 (reverse strand)."""
     if frame not in (1, 2, 3, -1, -2, -3):
         raise ValueError("frame must be one of 1, 2, 3, -1, -2, -3")
+    if table not in CodonTable.unambiguous_dna_by_id:
+        raise ValueError(f"Unsupported genetic code table: {table}")
+
+    seq = Seq(str(seq).upper().replace("U", "T"))
     if frame < 0:
         seq = seq.reverse_complement()
     seq = seq[abs(frame) - 1:]
-    seq = seq[: len(seq) - len(seq) % 3]  # drop trailing partial codon
+    seq = seq[: len(seq) - len(seq) % 3]
     return str(seq.translate(table=table, to_stop=to_stop))
 
 
@@ -160,71 +175,91 @@ def translate_dna(seq: Seq, frame: int = 1, table: int = 1, to_stop: bool = Fals
 # CLI commands
 # --------------------------------------------------------------------------
 def cmd_download(a):
-    path = download_fasta(a.accession, a.email, a.output)
-    rec = load_records(path)[0]
-    print(f"Saved {rec.id} ({len(rec.seq):,} bp) to {path}")
+    try:
+        path = download_fasta(a.accession, a.email, a.output)
+        rec = load_records(path)[0]
+        print(f"Saved {rec.id} ({len(rec.seq):,} bp) to {path}")
+    except (ValueError, FileNotFoundError) as exc:
+        sys.exit(f"Error: {exc}")
 
 
 def cmd_stats(a):
-    for rec in load_records(a.fasta):
-        st = sequence_stats(rec)
-        print(f"\n>{st['id']}  {st['description']}")
-        print(f"  Length        : {st['length']:,} bp")
-        print(f"  GC content    : {st['gc_percent']:.2f}%")
-        print(f"  AT content    : {st['at_percent']:.2f}%")
-        print(f"  GC skew       : {st['gc_skew']:+.4f}")
-        print(f"  Ambiguous (N) : {st['ambiguous']:,}")
-        print(f"  Starts w/ ATG : {st['starts_with_atg']}")
-        print("  Composition   : " + ", ".join(
-            f"{b}={n:,} ({100 * n / st['length']:.1f}%)" for b, n in st["composition"].items()))
+    try:
+        for rec in load_records(a.fasta):
+            st = sequence_stats(rec)
+            print(f"\n>{st['id']}  {st['description']}")
+            print(f"  Length        : {st['length']:,} bp")
+            print(f"  GC content    : {st['gc_percent']:.2f}%")
+            print(f"  AT content    : {st['at_percent']:.2f}%")
+            print(f"  GC skew       : {st['gc_skew']:+.4f}")
+            print(f"  Ambiguous (N) : {st['ambiguous']:,}")
+            print(f"  Starts w/ ATG : {st['starts_with_atg']}")
+            print("  Composition   : " + ", ".join(
+                f"{b}={n:,} ({100 * n / st['length']:.1f}%)" for b, n in st["composition"].items()))
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
 
 
 def cmd_orfs(a):
-    rec = load_records(a.fasta)[0]
-    seq = clean_seq(rec)
-    orfs = find_orfs(seq, min_aa=a.min_aa, table=a.table)
-    print(f"{rec.id}: {len(orfs)} ORFs >= {a.min_aa} aa (6 frames, ATG start)\n")
-    print(f"{'#':>3} {'strand':>6} {'frame':>5} {'start':>8} {'end':>8} {'nt':>7} {'aa':>6}  protein (first 30 aa)")
-    for k, o in enumerate(orfs[: a.top], 1):
-        print(f"{k:>3} {o['strand']:>6} {o['frame']:>5} {o['start']:>8} {o['end']:>8} "
-              f"{o['nt_length']:>7} {o['aa_length']:>6}  {o['protein'][:30]}")
-    if len(orfs) > a.top:
-        print(f"... {len(orfs) - a.top} more (raise --top to show them)")
+    try:
+        rec = load_records(a.fasta)[0]
+        seq = clean_seq(rec)
+        orfs = find_orfs(seq, min_aa=a.min_aa, table=a.table)
+        print(f"{rec.id}: {len(orfs)} ORFs >= {a.min_aa} aa (6 frames, ATG start)\n")
+        print(f"{'#':>3} {'strand':>6} {'frame':>5} {'start':>8} {'end':>8} {'nt':>7} {'aa':>6}  protein (first 30 aa)")
+        for k, o in enumerate(orfs[: a.top], 1):
+            print(f"{k:>3} {o['strand']:>6} {o['frame']:>5} {o['start']:>8} {o['end']:>8} "
+                  f"{o['nt_length']:>7} {o['aa_length']:>6}  {o['protein'][:30]}")
+        if len(orfs) > a.top:
+            print(f"... {len(orfs) - a.top} more (raise --top to show them)")
 
-    if a.proteins_out:
-        out = [
-            SeqRecord(Seq(o["protein"]),
-                      id=f"{rec.id}_ORF{k}",
-                      description=f"strand={o['strand']} frame={o['frame']} {o['start']}-{o['end']} {o['aa_length']}aa")
-            for k, o in enumerate(orfs, 1)
-        ]
-        SeqIO.write(out, a.proteins_out, "fasta")
-        print(f"\nWrote {len(out)} protein sequences to {a.proteins_out}")
+        if a.proteins_out:
+            out = [
+                SeqRecord(Seq(o["protein"]),
+                          id=f"{rec.id}_ORF{k}",
+                          description=f"strand={o['strand']} frame={o['frame']} {o['start']}-{o['end']} {o['aa_length']}aa")
+                for k, o in enumerate(orfs, 1)
+            ]
+            SeqIO.write(out, a.proteins_out, "fasta")
+            print(f"\nWrote {len(out)} protein sequences to {a.proteins_out}")
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
 
 
 def cmd_translate(a):
-    rec = load_records(a.fasta)[0]
-    seq = clean_seq(rec)
-    if a.start or a.end:
-        start = (a.start or 1) - 1
-        end = a.end or len(seq)
-        seq = seq[start:end]
-        # for region translation the region itself starts at its own frame 1
-    protein = translate_dna(seq, frame=a.frame, table=a.table, to_stop=a.to_stop)
-    print(f">{rec.id}_translated frame={a.frame} length={len(protein)}aa")
-    for i in range(0, len(protein), 60):
-        print(protein[i:i + 60])
+    try:
+        rec = load_records(a.fasta)[0]
+        seq = clean_seq(rec)
+        if a.start or a.end:
+            if a.start is not None and a.start < 1:
+                raise ValueError("--start must be >= 1")
+            if a.end is not None and a.end < 1:
+                raise ValueError("--end must be >= 1")
+            if a.start is not None and a.end is not None and a.end < a.start:
+                raise ValueError("--end must be greater than or equal to --start")
+            start = (a.start or 1) - 1
+            end = a.end or len(seq)
+            seq = seq[start:end]
+        protein = translate_dna(seq, frame=a.frame, table=a.table, to_stop=a.to_stop)
+        print(f">{rec.id}_translated frame={a.frame} length={len(protein)}aa")
+        for i in range(0, len(protein), 60):
+            print(protein[i:i + 60])
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
 
 
 def cmd_revcomp(a):
-    recs = load_records(a.fasta)
-    out = [SeqRecord(clean_seq(r).reverse_complement(), id=r.id + "_revcomp", description="reverse complement")
-           for r in recs]
-    if a.output:
-        SeqIO.write(out, a.output, "fasta")
-        print(f"Wrote {len(out)} record(s) to {a.output}")
-    else:
-        SeqIO.write(out, sys.stdout, "fasta")
+    try:
+        recs = load_records(a.fasta)
+        out = [SeqRecord(clean_seq(r).reverse_complement(), id=r.id + "_revcomp", description="reverse complement")
+               for r in recs]
+        if a.output:
+            SeqIO.write(out, a.output, "fasta")
+            print(f"Wrote {len(out)} record(s) to {a.output}")
+        else:
+            SeqIO.write(out, sys.stdout, "fasta")
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
 
 
 def build_parser():
